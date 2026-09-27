@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { gzipSync, gunzipSync } from 'zlib';
 import { neon } from '@neondatabase/serverless';
 import {
   AuctionRecord,
@@ -288,14 +289,30 @@ class DatabaseEngine {
     await this.sql`CREATE TABLE IF NOT EXISTS gl_collector_state (
       id SMALLINT PRIMARY KEY CHECK (id = 1),
       version INTEGER NOT NULL DEFAULT 1,
-      data JSONB NOT NULL,
+      payload TEXT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`;
-    await this.sql`INSERT INTO gl_collector_state (id, version, data)
-      VALUES (1, 1, ${JSON.stringify(this.state)}::jsonb)
+    // Les 7 959 cartes sont compactées (≈ 0,6 Mo au lieu de ≈ 10 Mo) afin de
+    // rester bien sous les limites de requête des fonctions serverless.
+    await this.sql`ALTER TABLE gl_collector_state ADD COLUMN IF NOT EXISTS payload TEXT`;
+    const initialPayload = this.encodeState(this.state);
+    await this.sql`INSERT INTO gl_collector_state (id, version, payload)
+      VALUES (1, 1, ${initialPayload})
       ON CONFLICT (id) DO NOTHING`;
-    const rows = await this.sql`SELECT data FROM gl_collector_state WHERE id = 1` as Array<{ data: DatabaseSchema | string }>;
-    if (rows[0]?.data) this.state = typeof rows[0].data === 'string' ? JSON.parse(rows[0].data) : rows[0].data;
+    const rows = await this.sql`SELECT payload FROM gl_collector_state WHERE id = 1` as Array<{ payload: string | null }>;
+    if (!rows[0]?.payload) {
+      await this.sql`UPDATE gl_collector_state SET payload = ${initialPayload}, updated_at = NOW() WHERE id = 1`;
+    } else {
+      this.state = this.decodeState(rows[0].payload);
+    }
+  }
+
+  private encodeState(state: DatabaseSchema): string {
+    return gzipSync(JSON.stringify(state)).toString('base64');
+  }
+
+  private decodeState(payload: string): DatabaseSchema {
+    return JSON.parse(gunzipSync(Buffer.from(payload, 'base64')).toString('utf-8')) as DatabaseSchema;
   }
 
   public async transaction<T>(fn: (db: DatabaseSchema) => Promise<T> | T): Promise<T> {
@@ -330,14 +347,14 @@ class DatabaseEngine {
   private async postgresTransaction<T>(fn: (db: DatabaseSchema) => Promise<T> | T): Promise<T> {
     if (!this.sql) throw new Error('Connexion PostgreSQL indisponible.');
     for (let attempt = 0; attempt < 3; attempt++) {
-      const rows = await this.sql`SELECT version, data FROM gl_collector_state WHERE id = 1` as Array<{ version: number | string; data: DatabaseSchema | string }>;
+      const rows = await this.sql`SELECT version, payload FROM gl_collector_state WHERE id = 1` as Array<{ version: number | string; payload: string }>;
       const row = rows[0];
       if (!row) throw new Error('État PostgreSQL introuvable.');
-      const snapshot = typeof row.data === 'string' ? JSON.parse(row.data) as DatabaseSchema : row.data;
+      const snapshot = this.decodeState(row.payload);
       this.state = structuredClone(snapshot);
       const result = await fn(this.state);
       const saved = await this.sql`UPDATE gl_collector_state
-        SET data = ${JSON.stringify(this.state)}::jsonb, version = version + 1, updated_at = NOW()
+        SET payload = ${this.encodeState(this.state)}, version = version + 1, updated_at = NOW()
         WHERE id = 1 AND version = ${Number(row.version)}
         RETURNING version`;
       if (saved.length > 0) return result;

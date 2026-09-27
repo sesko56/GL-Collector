@@ -4,6 +4,15 @@ import { createApp } from '../server.js';
 const appPromise = createApp(false);
 
 export default async function handler(req: any, res: any) {
-  const app = await appPromise;
-  return app(req, res);
+  try {
+    // Selon le routeur Vercel, le préfixe /api peut être retiré du chemin.
+    if (!String(req.url || '').startsWith('/api/')) {
+      req.url = `/api${String(req.url || '/').startsWith('/') ? '' : '/'}${req.url || ''}`;
+    }
+    const app = await appPromise;
+    return app(req, res);
+  } catch (error) {
+    console.error('API initialization failed:', error);
+    return res.status(500).json({ error: `Initialisation PostgreSQL impossible : ${(error as Error).message}` });
+  }
 }
