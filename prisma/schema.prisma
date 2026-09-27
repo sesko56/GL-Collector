@@ -1,0 +1,241 @@
+// Prisma Schema for Grand Line Card Collector — PostgreSQL Production Database
+// Source unique : One Piece Encyclopédie Fandom (FR)
+// https://onepiece.fandom.com/fr/wiki/One_Piece_Encyclop%C3%A9die
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Rarity {
+  MYTHIQUE
+  LEGENDAIRE
+  EPIQUE
+  RARE
+  PEU_COMMUNE
+  COMMUNE
+}
+
+enum AuctionStatus {
+  OUVERTE
+  TERMINEE
+  VENDUE
+  EXPIREE
+  ANNULEE
+}
+
+enum TransactionType {
+  BONUS_BIENVENUE
+  RESERVATION_ENCHERE
+  REMBOURSEMENT_SURENCHERE
+  VENTE_ENCHERE
+  ANNULATION_ENCHERE
+}
+
+enum UserRole {
+  JOUEUR
+  ADMIN
+}
+
+model User {
+  id                  String            @id @default(uuid())
+  email               String            @unique
+  username            String            @unique
+  passwordHash        String            @map("password_hash")
+  passwordSalt        String            @map("password_salt")
+  emailVerified       Boolean           @default(false) @map("email_verified")
+  verificationToken   String?           @map("verification_token")
+  verificationExpiresAt DateTime?       @map("verification_expires_at")
+  resetPasswordToken  String?           @map("reset_password_token")
+  resetTokenExpiresAt DateTime?         @map("reset_token_expires_at")
+  role                UserRole          @default(JOUEUR)
+  suspended           Boolean           @default(false)
+  coins               Int               @default(1000)
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+
+  boosterInventory    BoosterInventory?
+  boosterOpenings     BoosterOpening[]
+  collection          CardOwnership[]
+  auctionsCreated     Auction[]         @relation("SellerAuctions")
+  auctionsLeading     Auction[]         @relation("BidderAuctions")
+  bids                Bid[]
+  transactions        Transaction[]
+  notifications       Notification[]
+
+  @@map("users")
+}
+
+model WikiPage {
+  id              String              @id @default(uuid())
+  fandomPageId    Int                 @unique @map("fandom_page_id")
+  title           String              @unique
+  summary         String              @db.Text
+  category        String
+  sourceUrl       String              @map("source_url")
+  lastSyncedAt    DateTime            @default(now()) @map("last_synced_at")
+
+  card            Card?
+  viewStatistics  WikiViewStatistic[]
+
+  @@map("wiki_pages")
+}
+
+model WikiViewStatistic {
+  id          String   @id @default(uuid())
+  wikiPageId  String   @map("wiki_page_id")
+  year        Int
+  annualViews Int      @map("annual_views")
+  recordedAt  DateTime @default(now()) @map("recorded_at")
+
+  wikiPage    WikiPage @relation(fields: [wikiPageId], references: [id], onDelete: Cascade)
+
+  @@unique([wikiPageId, year])
+  @@map("wiki_view_statistics")
+}
+
+model Card {
+  id                  String              @id @default(uuid())
+  wikiPageId          String              @unique @map("wiki_page_id")
+  fandomPageId        Int                 @unique @map("fandom_page_id")
+  name                String
+  description         String              @db.Text
+  category            String
+  sourceUrl           String              @map("source_url")
+  rarity              Rarity              @default(COMMUNE)
+  annualViews         Int                 @default(0) @map("annual_views")
+  rarityYear          Int                 @default(0) @map("rarity_year")
+  active              Boolean             @default(true)
+  updatedAt           DateTime            @updatedAt @map("updated_at")
+
+  wikiPage            WikiPage            @relation(fields: [wikiPageId], references: [id])
+  ownerships          CardOwnership[]
+  auctions            Auction[]
+  rarityCalculations  RarityCalculation[]
+
+  @@map("cards")
+}
+
+model RarityCalculation {
+  id             String   @id @default(uuid())
+  cardId         String   @map("card_id")
+  year           Int
+  annualViews    Int      @map("annual_views")
+  percentileRank Float    @map("percentile_rank")
+  previousRarity Rarity?  @map("previous_rarity")
+  assignedRarity Rarity   @map("assigned_rarity")
+  calculatedAt   DateTime @default(now()) @map("calculated_at")
+
+  card           Card     @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@index([year])
+  @@map("rarity_calculations")
+}
+
+model CardOwnership {
+  id               String    @id @default(uuid())
+  userId           String    @map("user_id")
+  cardId           String    @map("card_id")
+  serialNumber     Int       @map("serial_number")
+  lockedForAuction Boolean   @default(false) @map("locked_for_auction")
+  acquiredAt       DateTime  @default(now()) @map("acquired_at")
+  boosterOpeningId String?   @map("booster_opening_id")
+
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  card             Card      @relation(fields: [cardId], references: [id])
+  auctions         Auction[]
+
+  @@index([userId, cardId])
+  @@map("card_ownerships")
+}
+
+model BoosterInventory {
+  id             String   @id @default(uuid())
+  userId         String   @unique @map("user_id")
+  storedBoosters Int      @default(10) @map("stored_boosters")
+  lastRechargeAt DateTime @default(now()) @map("last_recharge_at")
+
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("booster_inventory")
+}
+
+model BoosterOpening {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id")
+  openedAt    DateTime @default(now()) @map("opened_at")
+  cardIdsJson String   @map("card_ids_json")
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("booster_openings")
+}
+
+model Auction {
+  id               String        @id @default(uuid())
+  cardId           String        @map("card_id")
+  cardOwnershipId  String        @map("card_ownership_id")
+  sellerId         String        @map("seller_id")
+  startingPrice    Int           @map("starting_price")
+  currentBid       Int           @map("current_bid")
+  currentBidderId  String?       @map("current_bidder_id")
+  startDate        DateTime      @default(now()) @map("start_date")
+  endDate          DateTime      @map("end_date")
+  status           AuctionStatus @default(OUVERTE)
+
+  card             Card          @relation(fields: [cardId], references: [id])
+  cardOwnership    CardOwnership @relation(fields: [cardOwnershipId], references: [id])
+  seller           User          @relation("SellerAuctions", fields: [sellerId], references: [id])
+  currentBidder    User?         @relation("BidderAuctions", fields: [currentBidderId], references: [id])
+  bids             Bid[]
+
+  @@index([status, endDate])
+  @@map("auctions")
+}
+
+model Bid {
+  id        String   @id @default(uuid())
+  auctionId String   @map("auction_id")
+  bidderId  String   @map("bidder_id")
+  amount    Int
+  createdAt DateTime @default(now()) @map("created_at")
+
+  auction   Auction  @relation(fields: [auctionId], references: [id], onDelete: Cascade)
+  bidder    User     @relation(fields: [bidderId], references: [id], onDelete: Cascade)
+
+  @@map("bids")
+}
+
+model Transaction {
+  id            String          @id @default(uuid())
+  userId        String          @map("user_id")
+  amount        Int
+  type          TransactionType
+  reference     String
+  balanceBefore Int             @map("balance_before")
+  balanceAfter  Int             @map("balance_after")
+  createdAt     DateTime        @default(now()) @map("created_at")
+
+  user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("transactions")
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  type      String
+  message   String
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, read])
+  @@map("notifications")
+}
