@@ -14,4 +14,15 @@ Application de cartes de collection **GL Collector** avec marché d'enchères en
 Les routes `/api/*` sont exposées par `api/[...path].ts` et le front est servi depuis `dist`.
 Après avoir poussé ces fichiers, redéployez le projet Vercel (sans modifier la commande de build).
 
-Ajoutez la variable `DATABASE_URL` fournie par Neon dans Vercel (Production, Preview et Development). Au premier démarrage, l'application crée la table `gl_collector_state` et importe automatiquement l'état local ; les comptes et la progression sont ensuite persistés dans Neon.
+Le catalogue (~7959 cartes) est **embarqué** dans l’application (`server/data/wikiFullCatalog.json`). Neon ne stocke que les comptes, collections, boosters, enchères et la config.
+
+1. Dans Vercel, liez le store **Neon** au projet (Storage → Connect) ou collez `DATABASE_URL` dans Settings → Environment Variables, pour **Production**, **Preview** et **Development**.
+2. L’URL doit ressembler à `postgresql://...@....neon.tech/neondb?sslmode=require`.
+3. Redéployez, puis ouvrez le site une fois : la table `gl_collector_state` est créée (progression uniquement).
+
+Pour copier vos comptes / collections locales vers Neon :
+
+```
+# Dans .env local, mettez l’URL Neon de Vercel, puis :
+npm run seed:neon
+```

@@ -1,5 +1,9 @@
 import { createApp } from '../server.js';
 
+export const config = {
+  maxDuration: 60,
+};
+
 // Une seule instance Express par exécution serverless ; le catch-all couvre /api/*.
 const appPromise = createApp(false);
 

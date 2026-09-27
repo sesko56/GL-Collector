@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { gzipSync, gunzipSync } from 'zlib';
 import { neon } from '@neondatabase/serverless';
 import {
@@ -74,6 +75,52 @@ export interface DatabaseSchema {
   importLogs: WikiImportLog[];
   auditLogs: Array<{ id: string; timestamp: string; actorId: string | null; action: string; details: string }>;
   globalMintCounter: number;
+}
+
+/** Données persistées (Neon / fichier local). Le catalogue de cartes n’en fait pas partie. */
+export interface PlayerState {
+  config: SystemConfig;
+  users: StoredUser[];
+  sessions: DatabaseSchema['sessions'];
+  cardOwnerships: CardOwnershipRecord[];
+  boosterInventories: StoredBoosterInventory[];
+  boosterOpenings: StoredBoosterOpening[];
+  auctions: AuctionRecord[];
+  bids: BidRecord[];
+  transactions: TransactionRecord[];
+  notifications: NotificationRecord[];
+  importLogs: WikiImportLog[];
+  auditLogs: DatabaseSchema['auditLogs'];
+  globalMintCounter: number;
+  rarityRuns: RarityRunSummary[];
+  rarityCalculations: RarityCalculationRecord[];
+}
+
+interface CatalogSlice {
+  wikiPages: WikiPageRecord[];
+  wikiViewStats: WikiViewStatRecord[];
+  cards: CardRecord[];
+}
+
+export function extractPlayerState(state: Partial<DatabaseSchema> & Record<string, unknown>): PlayerState {
+  const schema = state as DatabaseSchema;
+  return {
+    config: schema.config,
+    users: schema.users || [],
+    sessions: schema.sessions || {},
+    cardOwnerships: schema.cardOwnerships || [],
+    boosterInventories: schema.boosterInventories || [],
+    boosterOpenings: schema.boosterOpenings || [],
+    auctions: schema.auctions || [],
+    bids: schema.bids || [],
+    transactions: schema.transactions || [],
+    notifications: schema.notifications || [],
+    importLogs: schema.importLogs || [],
+    auditLogs: schema.auditLogs || [],
+    globalMintCounter: schema.globalMintCounter || 1,
+    rarityRuns: schema.rarityRuns || [],
+    rarityCalculations: (schema.rarityCalculations || []).slice(0, 150),
+  };
 }
 
 export function hashPassword(password: string, salt?: string): { hash: string; salt: string } {
@@ -262,7 +309,28 @@ const FAMOUS_ENTITIES: Record<string, { views: number; category: string; summary
   },
 };
 
-const DB_FILE_PATH = path.resolve(process.cwd(), 'server', 'data', 'runtime-db.json');
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+function resolveDataFile(filename: string): string {
+  const candidates = [
+    path.join(MODULE_DIR, 'data', filename),
+    path.resolve(process.cwd(), 'server', 'data', filename),
+    path.resolve(process.cwd(), filename),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
+}
+
+const PLAYER_FILE_PATH = resolveDataFile('runtime-player.json');
+const LEGACY_DB_FILE_PATH = resolveDataFile('runtime-db.json');
+const CATALOG_FILE_PATH = resolveDataFile('wikiFullCatalog.json');
+const MIN_CATALOG_CARDS = 7000;
+const DEFAULT_THRESHOLDS: RarityThresholds = {
+  MYTHIQUE: 1,
+  LEGENDAIRE: 5,
+  EPIQUE: 10,
+  RARE: 25,
+  PEU_COMMUNE: 50,
+};
 
 class DatabaseEngine {
   public state: DatabaseSchema;
@@ -272,16 +340,53 @@ class DatabaseEngine {
   private readonly readyPromise: Promise<void>;
 
   constructor() {
-    this.state = this.loadOrSeed();
+    const catalog = this.createCatalog();
+    const player = this.loadPlayerState() ?? this.createEmptyPlayerState(catalog);
+    this.state = this.assemble(catalog, player);
     this.readyPromise = this.sql ? this.hydrateFromPostgres() : Promise.resolve();
   }
 
-  /** Initialise Neon et importe automatiquement le catalogue local au premier lancement. */
+  /** Connecte Neon (comptes / collections) et vérifie que le catalogue est bien bundlé. */
   public async ready(): Promise<void> {
     if (process.env.VERCEL && !this.sql) {
       throw new Error('La variable de connexion Neon est manquante. Ajoutez DATABASE_URL dans les paramètres Vercel.');
     }
+    if (process.env.VERCEL && this.state.cards.length < MIN_CATALOG_CARDS) {
+      throw new Error(
+        `Catalogue introuvable (${this.state.cards.length} cartes). Vérifiez que server/data/wikiFullCatalog.json est déployé.`
+      );
+    }
     return this.readyPromise;
+  }
+
+  private catalogSlice(): CatalogSlice {
+    return {
+      cards: this.state.cards,
+      wikiPages: this.state.wikiPages,
+      wikiViewStats: this.state.wikiViewStats,
+    };
+  }
+
+  private assemble(catalog: CatalogSlice, player: PlayerState): DatabaseSchema {
+    this.applyThresholds(catalog.cards, player.config);
+    return {
+      ...player,
+      cards: catalog.cards,
+      wikiPages: catalog.wikiPages,
+      wikiViewStats: catalog.wikiViewStats,
+    };
+  }
+
+  private applyThresholds(cards: CardRecord[], config: SystemConfig): void {
+    const thresholds = config?.rarityThresholds || DEFAULT_THRESHOLDS;
+    const year = config?.currentRarityYear || new Date().getFullYear();
+    const ranked = [...cards].sort((a, b) => b.annualViews - a.annualViews);
+    const total = ranked.length || 1;
+    ranked.forEach((item, index) => {
+      const percentileRank = Number((((index + 1) / total) * 100).toFixed(3));
+      item.rarity = computeRarityForPercentile(percentileRank, thresholds);
+      item.rarityYear = year;
+    });
   }
 
   private async hydrateFromPostgres(): Promise<void> {
@@ -292,27 +397,35 @@ class DatabaseEngine {
       payload TEXT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`;
-    // Les 7 959 cartes sont compactées (≈ 0,6 Mo au lieu de ≈ 10 Mo) afin de
-    // rester bien sous les limites de requête des fonctions serverless.
     await this.sql`ALTER TABLE gl_collector_state ADD COLUMN IF NOT EXISTS payload TEXT`;
-    const initialPayload = this.encodeState(this.state);
+    const initialPayload = this.encodePlayer(this.state);
     await this.sql`INSERT INTO gl_collector_state (id, version, payload)
       VALUES (1, 1, ${initialPayload})
       ON CONFLICT (id) DO NOTHING`;
     const rows = await this.sql`SELECT payload FROM gl_collector_state WHERE id = 1` as Array<{ payload: string | null }>;
-    if (!rows[0]?.payload) {
-      await this.sql`UPDATE gl_collector_state SET payload = ${initialPayload}, updated_at = NOW() WHERE id = 1`;
-    } else {
-      this.state = this.decodeState(rows[0].payload);
+    if (!rows[0]?.payload) return;
+
+    const decoded = this.decodePayload(rows[0].payload);
+    const legacyCatalog = Array.isArray(decoded.cards) && (decoded.cards as unknown[]).length > 0;
+    const player = extractPlayerState(decoded);
+    this.state = this.assemble(this.catalogSlice(), player);
+    if (legacyCatalog) {
+      await this.sql`UPDATE gl_collector_state
+        SET payload = ${this.encodePlayer(this.state)}, version = version + 1, updated_at = NOW()
+        WHERE id = 1`;
     }
   }
 
-  private encodeState(state: DatabaseSchema): string {
-    return gzipSync(JSON.stringify(state)).toString('base64');
+  private encodePlayer(state: DatabaseSchema): string {
+    return gzipSync(JSON.stringify(extractPlayerState(state))).toString('base64');
   }
 
-  private decodeState(payload: string): DatabaseSchema {
-    return JSON.parse(gunzipSync(Buffer.from(payload, 'base64')).toString('utf-8')) as DatabaseSchema;
+  private decodePayload(payload: string): Partial<DatabaseSchema> & Record<string, unknown> {
+    try {
+      return JSON.parse(gunzipSync(Buffer.from(payload, 'base64')).toString('utf-8'));
+    } catch {
+      return JSON.parse(payload);
+    }
   }
 
   public async transaction<T>(fn: (db: DatabaseSchema) => Promise<T> | T): Promise<T> {
@@ -350,11 +463,11 @@ class DatabaseEngine {
       const rows = await this.sql`SELECT version, payload FROM gl_collector_state WHERE id = 1` as Array<{ version: number | string; payload: string }>;
       const row = rows[0];
       if (!row) throw new Error('État PostgreSQL introuvable.');
-      const snapshot = this.decodeState(row.payload);
-      this.state = structuredClone(snapshot);
+      const snapshot = this.decodePayload(row.payload);
+      this.state = this.assemble(this.catalogSlice(), extractPlayerState(snapshot));
       const result = await fn(this.state);
       const saved = await this.sql`UPDATE gl_collector_state
-        SET payload = ${this.encodeState(this.state)}, version = version + 1, updated_at = NOW()
+        SET payload = ${this.encodePlayer(this.state)}, version = version + 1, updated_at = NOW()
         WHERE id = 1 AND version = ${Number(row.version)}
         RETURNING version`;
       if (saved.length > 0) return result;
@@ -363,14 +476,13 @@ class DatabaseEngine {
   }
 
   public persist(): void {
-    // La persistance PostgreSQL est assurée dans transaction().
     if (this.sql) return;
     try {
-      const dir = path.dirname(DB_FILE_PATH);
+      const dir = path.dirname(PLAYER_FILE_PATH);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      fs.writeFileSync(DB_FILE_PATH, JSON.stringify(this.state, null, 2), 'utf-8');
+      fs.writeFileSync(PLAYER_FILE_PATH, JSON.stringify(extractPlayerState(this.state), null, 2), 'utf-8');
     } catch {
       // Memory fallback
     }
@@ -389,77 +501,41 @@ class DatabaseEngine {
     }
   }
 
-  private loadOrSeed(): DatabaseSchema {
-    try {
-      if (fs.existsSync(DB_FILE_PATH)) {
-        const raw = fs.readFileSync(DB_FILE_PATH, 'utf-8');
-        const parsed = JSON.parse(raw) as DatabaseSchema;
-        if (parsed && parsed.cards && parsed.cards.length >= 7000) {
-          return parsed;
+  private loadPlayerState(): PlayerState | null {
+    const candidates = [PLAYER_FILE_PATH, LEGACY_DB_FILE_PATH];
+    for (const filePath of candidates) {
+      try {
+        if (!fs.existsSync(filePath)) continue;
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Partial<DatabaseSchema> & Record<string, unknown>;
+        if (parsed?.users && parsed?.config) {
+          return extractPlayerState(parsed);
         }
+      } catch {
+        // Ignore
       }
-    } catch {
-      // Ignore
     }
-    const seeded = this.createSeedDatabase();
-    try {
-      const dir = path.dirname(DB_FILE_PATH);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(DB_FILE_PATH, JSON.stringify(seeded, null, 2), 'utf-8');
-    } catch {
-      // Ignore
-    }
-    return seeded;
+    return null;
   }
 
-  private createSeedDatabase(): DatabaseSchema {
-    const thresholds: RarityThresholds = {
-      MYTHIQUE: 1,
-      LEGENDAIRE: 5,
-      EPIQUE: 10,
-      RARE: 25,
-      PEU_COMMUNE: 50,
-    };
-
-    const config: SystemConfig = {
-      rarityThresholds: thresholds,
-      currentRarityYear: new Date().getFullYear(),
-      lastAnnualCalculationAt: new Date().toISOString(),
-      cardsPerBooster: 5,
-      boosterRechargeMinutes: 10,
-      maxBoosters: 10,
-      boosterProbabilities: {
-        COMMUNE: 60,
-        PEU_COMMUNE: 25,
-        RARE: 10,
-        EPIQUE: 4,
-        LEGENDAIRE: 0.9,
-        MYTHIQUE: 0.1,
-      },
-    };
+  private createCatalog(): CatalogSlice {
+    const thresholds = DEFAULT_THRESHOLDS;
 
     // Charger l'intégralité des 7959 articles de One Piece Fandom FR
     let rawCatalog: Array<{ fandomPageId: number; title: string }> = [];
-    const catalogPath = path.resolve(process.cwd(), 'server', 'data', 'wikiFullCatalog.json');
-    if (fs.existsSync(catalogPath)) {
+    if (fs.existsSync(CATALOG_FILE_PATH)) {
       try {
-        rawCatalog = JSON.parse(fs.readFileSync(catalogPath, 'utf-8'));
+        rawCatalog = JSON.parse(fs.readFileSync(CATALOG_FILE_PATH, 'utf-8'));
       } catch {
         // Fallback
       }
     }
 
     if (rawCatalog.length === 0) {
-      // Secours si le fichier JSON n'était pas chargé
-      for (const [title, meta] of Object.entries(FAMOUS_ENTITIES)) {
+      for (const title of Object.keys(FAMOUS_ENTITIES)) {
         rawCatalog.push({ fandomPageId: Math.floor(1000 + Math.random() * 9000), title });
       }
     }
 
-    // Répartition de la fréquentation annuelle sur 12 mois pour chaque article
-    // Les articles majeurs ont des vues exactes, les autres suivent la décroissance naturelle
     const sortedItems = rawCatalog.map((item, index) => {
       const famous = FAMOUS_ENTITIES[item.title];
       let views = 0;
@@ -474,7 +550,6 @@ class DatabaseEngine {
         const detected = detectCategoryAndSummary(item.title);
         category = detected.category;
         summary = detected.summary;
-        // Distribution en loi de puissance selon la position
         const rank = index + 1;
         const baseViews = Math.round(1800000 / Math.pow(rank + 10, 0.65));
         const variance = ((item.fandomPageId * 17) % 2500) - 1200;
@@ -493,15 +568,13 @@ class DatabaseEngine {
     const wikiPages: WikiPageRecord[] = [];
     const wikiViewStats: WikiViewStatRecord[] = [];
     const cards: CardRecord[] = [];
-    const total = sortedItems.length;
+    const total = sortedItems.length || 1;
 
     sortedItems.forEach((item, index) => {
       const wikiPageId = `wp-${item.fandomPageId}`;
       const cardId = `card-${item.fandomPageId}`;
       const encoded = encodeURIComponent(item.title.replace(/ /g, '_'));
       const sourceUrl = `https://onepiece.fandom.com/fr/wiki/${encoded}`;
-
-      // Rang centile strict : index 0 (Luffy) = 0.01% -> Mythique
       const percentileRank = Number((((index + 1) / total) * 100).toFixed(3));
       const assignedRarity = computeRarityForPercentile(percentileRank, thresholds);
 
@@ -539,108 +612,116 @@ class DatabaseEngine {
       });
     });
 
-    // Utilisateur de base : 0 CARTES, AUCUNE ENCHÈRE
+    return { wikiPages, wikiViewStats, cards };
+  }
+
+  private createEmptyPlayerState(catalog: CatalogSlice): PlayerState {
+    const now = new Date();
     const p1 = hashPassword('GrandLine2026!');
     const userId = 'user-capitaine';
-    const now = new Date();
-
-    const users: StoredUser[] = [
-      {
-        id: userId,
-        email: 'capitaine@onepiece-cards.fr',
-        username: 'Capitaine_Archiviste',
-        passwordHash: p1.hash,
-        passwordSalt: p1.salt,
-        emailVerified: true,
-        verificationToken: null,
-        resetPasswordToken: null,
-        resetTokenExpiresAt: null,
-        role: 'ADMIN',
-        suspended: false,
-        coins: 1000,
-        createdAt: now.toISOString(),
-        updatedAt: now.toISOString(),
+    const config: SystemConfig = {
+      rarityThresholds: { ...DEFAULT_THRESHOLDS },
+      currentRarityYear: now.getFullYear(),
+      lastAnnualCalculationAt: now.toISOString(),
+      cardsPerBooster: 5,
+      boosterRechargeMinutes: 10,
+      maxBoosters: 10,
+      boosterProbabilities: {
+        COMMUNE: 60,
+        PEU_COMMUNE: 25,
+        RARE: 10,
+        EPIQUE: 4,
+        LEGENDAIRE: 0.9,
+        MYTHIQUE: 0.1,
       },
-    ];
-
-    const boosterInventories: StoredBoosterInventory[] = [
-      {
-        id: 'bi-1',
-        userId,
-        storedBoosters: 10,
-        lastRechargeAt: now.toISOString(),
-      },
-    ];
-
-    const transactions: TransactionRecord[] = [
-      {
-        id: 'tx-welcome',
-        userId,
-        username: 'Capitaine_Archiviste',
-        amount: 1000,
-        type: 'BONUS_BIENVENUE',
-        reference: 'Dotation de bienvenue — Inscription',
-        balanceBefore: 0,
-        balanceAfter: 1000,
-        createdAt: now.toISOString(),
-      },
-    ];
-
-    const notifications: NotificationRecord[] = [
-      {
-        id: 'notif-welcome',
-        userId,
-        type: 'BOOSTER_DISPONIBLE',
-        message: 'Bienvenue sur GL Collector ! Vous avez 10 boosters prêts à être ouverts.',
-        read: false,
-        createdAt: now.toISOString(),
-      },
-    ];
+    };
 
     return {
       config,
-      users,
-      sessions: {},
-      wikiPages,
-      wikiViewStats,
-      cards,
-      rarityCalculations: [],
-      rarityRuns: [
+      users: [
         {
-          id: 'run-2026',
-          year: 2026,
-          calculatedAt: '2026-01-01T00:00:00.000Z',
-          totalCards: cards.length,
-          changedCount: 0,
-          thresholds,
-          distribution: {
-            MYTHIQUE: cards.filter((c) => c.rarity === 'MYTHIQUE').length,
-            LEGENDAIRE: cards.filter((c) => c.rarity === 'LEGENDAIRE').length,
-            EPIQUE: cards.filter((c) => c.rarity === 'EPIQUE').length,
-            RARE: cards.filter((c) => c.rarity === 'RARE').length,
-            PEU_COMMUNE: cards.filter((c) => c.rarity === 'PEU_COMMUNE').length,
-            COMMUNE: cards.filter((c) => c.rarity === 'COMMUNE').length,
-          },
+          id: userId,
+          email: 'capitaine@onepiece-cards.fr',
+          username: 'Capitaine_Archiviste',
+          passwordHash: p1.hash,
+          passwordSalt: p1.salt,
+          emailVerified: true,
+          verificationToken: null,
+          resetPasswordToken: null,
+          resetTokenExpiresAt: null,
+          role: 'ADMIN',
+          suspended: false,
+          coins: 1000,
+          createdAt: now.toISOString(),
+          updatedAt: now.toISOString(),
         },
       ],
+      sessions: {},
       cardOwnerships: [],
-      boosterInventories,
+      boosterInventories: [
+        {
+          id: 'bi-1',
+          userId,
+          storedBoosters: 10,
+          lastRechargeAt: now.toISOString(),
+        },
+      ],
       boosterOpenings: [],
       auctions: [],
       bids: [],
-      transactions,
-      notifications,
+      transactions: [
+        {
+          id: 'tx-welcome',
+          userId,
+          username: 'Capitaine_Archiviste',
+          amount: 1000,
+          type: 'BONUS_BIENVENUE',
+          reference: 'Dotation de bienvenue — Inscription',
+          balanceBefore: 0,
+          balanceAfter: 1000,
+          createdAt: now.toISOString(),
+        },
+      ],
+      notifications: [
+        {
+          id: 'notif-welcome',
+          userId,
+          type: 'BOOSTER_DISPONIBLE',
+          message: 'Bienvenue sur GL Collector ! Vous avez 10 boosters prêts à être ouverts.',
+          read: false,
+          createdAt: now.toISOString(),
+        },
+      ],
       importLogs: [
         {
           id: 'imp-fandom-full',
           startedAt: '2026-01-01T00:00:00.000Z',
           completedAt: '2026-01-01T00:00:05.000Z',
           source: 'GL Collector Database Index',
-          pagesImported: cards.length,
+          pagesImported: catalog.cards.length,
           pagesUpdated: 0,
           pagesSkipped: 0,
           errors: [],
           status: 'SUCCES',
+        },
+      ],
+      rarityCalculations: [],
+      rarityRuns: [
+        {
+          id: 'run-2026',
+          year: 2026,
+          calculatedAt: '2026-01-01T00:00:00.000Z',
+          totalCards: catalog.cards.length,
+          changedCount: 0,
+          thresholds: { ...DEFAULT_THRESHOLDS },
+          distribution: {
+            MYTHIQUE: catalog.cards.filter((c) => c.rarity === 'MYTHIQUE').length,
+            LEGENDAIRE: catalog.cards.filter((c) => c.rarity === 'LEGENDAIRE').length,
+            EPIQUE: catalog.cards.filter((c) => c.rarity === 'EPIQUE').length,
+            RARE: catalog.cards.filter((c) => c.rarity === 'RARE').length,
+            PEU_COMMUNE: catalog.cards.filter((c) => c.rarity === 'PEU_COMMUNE').length,
+            COMMUNE: catalog.cards.filter((c) => c.rarity === 'COMMUNE').length,
+          },
         },
       ],
       auditLogs: [
@@ -649,7 +730,7 @@ class DatabaseEngine {
           timestamp: now.toISOString(),
           actorId: 'SYSTEM',
           action: 'FULL_WIKI_INITIALIZATION',
-          details: `Initialisation de ${cards.length} cartes du catalogue officiel GL Collector.`,
+          details: `Catalogue embarqué : ${catalog.cards.length} cartes.`,
         },
       ],
       globalMintCounter: 1,
