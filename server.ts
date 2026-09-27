@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
@@ -83,6 +84,7 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
 
 /** Crée l'API réutilisable localement et par la fonction serverless Vercel. */
 export async function createApp(includeFrontend = false) {
+  await db.ready();
   const app = express();
   app.use(express.json({ limit: '2mb' }));
   app.use('/api', rateLimitMiddleware(), attachUserMiddleware);
