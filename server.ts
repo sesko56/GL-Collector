@@ -81,7 +81,8 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
   next();
 }
 
-async function startServer() {
+/** Crée l'API réutilisable localement et par la fonction serverless Vercel. */
+export async function createApp(includeFrontend = false) {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
   app.use('/api', rateLimitMiddleware(), attachUserMiddleware);
@@ -382,25 +383,27 @@ async function startServer() {
     }
   });
 
-  // Vite middleware / Static
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+  if (includeFrontend) {
+    // Vite middleware / Static (uniquement pour l'exécution locale).
+    if (process.env.NODE_ENV !== 'production') {
+      const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.resolve(process.cwd(), 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
+    }
   }
 
+  return app;
+}
+
+async function startServer() {
+  const app = await createApp(true);
   const PORT = Number(process.env.PORT) || 3000;
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`GL Collector server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer();
+if (!process.env.VERCEL) startServer();
