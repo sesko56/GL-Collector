@@ -5,7 +5,12 @@
     "api/[...path].ts": {
       "includeFiles": "server/data/wikiFullCatalog.json",
       "maxDuration": 60
-    },
-  
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/index.html"
+    }
   ]
 }
