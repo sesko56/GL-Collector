@@ -8,6 +8,7 @@ export const config = {
 const appPromise = createApp(false);
 
 export default async function handler(req: any, res: any) {
+	  console.log('API HIT:', req.method, req.url);
   try {
     // Selon le routeur Vercel, le préfixe /api peut être retiré du chemin.
     if (!String(req.url || '').startsWith('/api/')) {
