@@ -214,9 +214,12 @@ export async function createApp(includeFrontend = false) {
     }
   });
 
+  
   // Collection (with pagination across 7,959 articles)
-  app.get('/api/collection', (req: AuthenticatedRequest, res: Response) => {
+  app.get('/api/collection', async (req: AuthenticatedRequest, res: Response) => {
     try {
+      await db.ready();
+
       const { search, rarity, category, ownership, sort, page, limit } = req.query;
       const overview = CollectionService.getUserCollection(req.user?.id || null, {
         search: typeof search === 'string' ? search : undefined,
@@ -232,6 +235,8 @@ export async function createApp(includeFrontend = false) {
       res.status(500).json({ error: (err as Error).message });
     }
   });
+
+
 
   // Auctions
   app.get('/api/auctions', async (_req: Request, res: Response) => {
