@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { db, StoredUser } from './server/db.js';
 import { AuctionService } from './server/services/AuctionService.js';
 import { BoosterService } from './server/services/BoosterService.js';
@@ -388,6 +387,7 @@ export async function createApp(includeFrontend = false) {
   if (includeFrontend) {
     // Vite middleware / Static (uniquement pour l'exécution locale).
     if (process.env.NODE_ENV !== 'production') {
+	const { createServer: createViteServer } = await import('vite');		
       const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
       app.use(vite.middlewares);
     } else {
